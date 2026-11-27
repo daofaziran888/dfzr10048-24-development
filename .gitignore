@@ -94,3 +94,5 @@ desktop.ini
 *.db
 *.pid
 *.seed
+backend/runtime_data/
+runtime_data/

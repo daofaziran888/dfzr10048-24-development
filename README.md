@@ -72,6 +72,37 @@ npm run dev
 | 交付回执 | `delivery_receipt` | 回执记录 | 回执编号、关联字幕包、接收方标识 |
 | 归档架位 | `archive_shelf` | 归档条目 | 归档编号、关联媒体源、架位标识 |
 | 采集审计 | `media_audit` | 审计条目 | 审计编号、关联对象、操作类型 |
+| 说话人改标事件 | `relabel_event` | 改标事件 | 事件编号、关联分段、说话人标签、回执编号、是否采纳、改标次数 |
+| 转写装配稿 | `assembly_draft` | 装配稿 | 装配稿编号、绑定版本、装配行数、关联字幕包 |
+
+## 说话人改标可追溯（字幕署名争议）
+
+处置字幕署名争议时，通用列表只能看到最新说话人标签，缺少「当时是谁、把什么改成什么」的人工凭据。平台因此新增一条持久化追溯链：
+
+- **改标事件台账**（`app/pipeline/relabel_event_ledger.py`）：每次机器回执与人工更正都落盘到 `backend/runtime_data/relabel_events.json`，重启可读回。
+  - 人工改标即时生效并确认，并使该分段此前待确认的机器领取失效；
+  - 机器回执按 `receipt_id` 幂等，重送不新增事件、不增加改标次数；
+  - 人工结论形成后，迟到的机器结果只留痕（`applied=false`），不能更改人工结论；
+  - 改标次数只统计已采纳的人工改标。
+- **转写版本装配**（`app/pipeline/transcript_assembly.py`）：为每个转写版本冻结不可变装配稿（`assembly_drafts.json`），逐行（字幕行号/语音段）绑定实际采用的标签、写入人、原标签与来源事件，凭据跟随实际正文；重装一份生成一份新稿，旧稿保留。
+- **字幕包关联实际装配稿**：字幕包通过 `draft_id` 关联到当时的装配稿，可沿行号还原写入人和原标签，并支持与已发字幕逐行对照。
+- **写入人隔离**：可按 `operator` 查询，编辑 B 只读自己的改标来源。
+
+### 追溯接口（前缀 `/api/traceability`）
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| POST | `/relabel/machine` | 登记机器回执（重送幂等、人工结论后迟到拒收） |
+| POST | `/relabel/manual` | 登记人工改标（即时生效） |
+| POST | `/relabel/confirm` | 确认机器回执 |
+| GET | `/relabel/events` | 按分段/写入人查询改标事件 |
+| POST | `/assemble` | 为转写版本装配一份新稿 |
+| POST | `/packs/link` | 字幕包关联实际装配稿 |
+| GET | `/packs/{pack_id}/draft` | 取字幕包实际装配稿 |
+| GET | `/packs/{pack_id}/lines/{line_no}` | 逐行还原写入人与原标签 |
+| POST | `/packs/{pack_id}/compare` | 与已发字幕逐行对照 |
+
+持久化目录由 `app/config.py` 的 `runtime_dir` 控制（默认 `backend/runtime_data/`，已加入 `.gitignore`）；容器部署时在 `docker-compose.yml` 挂载命名卷 `traceability_data`。
 
 ## 约定
 

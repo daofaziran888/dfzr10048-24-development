@@ -5,6 +5,9 @@ services:
       - "8005:8005"
     environment:
       - APP_ENV=local
+    # 改标事件、装配稿等可追溯数据落盘到命名卷，容器重启后仍可读回。
+    volumes:
+      - traceability_data:/srv/app/runtime_data
   frontend:
     build: ./frontend
     ports:
@@ -14,3 +17,7 @@ services:
       VITE_PROXY_TARGET: http://backend:8005
     depends_on:
       - backend
+
+volumes:
+  traceability_data:
+

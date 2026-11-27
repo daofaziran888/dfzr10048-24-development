@@ -24,12 +24,27 @@ from app.pipeline.version_conflict_resolver import VersionConflictResolver, Vers
 from app.pipeline.sample_qc_gate import SampleQcGate
 from app.pipeline.subtitle_pack_assembler import SubtitlePackAssembler
 from app.pipeline.archive_reclaimer import ArchiveReclaimer
+from app.pipeline.relabel_event_ledger import RelabelEventLedger
+from app.pipeline.transcript_assembly import TranscriptAssemblyService
+from app.pipeline import traceability as _traceability
+
+
+def _shared_ledger() -> RelabelEventLedger:
+    return _traceability.relabel_ledger()
+
+
+def _shared_assembly() -> TranscriptAssemblyService:
+    return _traceability.assembly_service()
 
 
 class PipelineOrchestrator:
     """管线编排器：执行 10 条业务链路并记录执行轨迹。"""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        relabel_ledger: RelabelEventLedger | None = None,
+        assembly_service: TranscriptAssemblyService | None = None,
+    ) -> None:
         self.shard_wm = ShardWatermarkChecker()
         self.redeliver = RedeliverEngine()
         self.quota = TranscribeQuotaManager()
@@ -37,6 +52,15 @@ class PipelineOrchestrator:
         self.qc_gate = SampleQcGate()
         self.pack = SubtitlePackAssembler()
         self.archive = ArchiveReclaimer()
+        # 改标追溯组件默认走共享持久化单例；测试可注入临时目录实例做隔离。
+        self.relabel = relabel_ledger or _shared_ledger()
+        if assembly_service is not None:
+            self.assembly = assembly_service
+        elif relabel_ledger is not None:
+            # 只注入台账时，装配稿服务落在台账同目录，避免错配到共享单例。
+            self.assembly = TranscriptAssemblyService.companion_to_ledger(self.relabel)
+        else:
+            self.assembly = _shared_assembly()
         self.audit_log: list[dict[str, Any]] = []
         self._run_id = 0
 
@@ -272,4 +296,122 @@ class PipelineOrchestrator:
             "qc_gate": self.qc_gate.snapshot(),
             "pack": self.pack.snapshot(),
             "archive": self.archive.snapshot(),
+            "relabel": self.relabel.snapshot(),
+            "assembly": self.assembly.snapshot(),
+        }
+
+    def link11_speaker_relabel_traceability(
+        self,
+        segment_id: str,
+        machine_label: str,
+        machine_receipt: str,
+        manual_label: str,
+        operator: str,
+        version_id: str,
+        pack_id: str,
+        line_text: str = "字幕正文",
+        line_no: int = 1,
+        late_receipt: str | None = None,
+    ) -> dict[str, Any]:
+        """链路11：字幕署名争议全链路（场景 A）。
+
+        时序：机器把某段标成乙（领取未确认）→ 装配首份稿并关联首包
+        → 人工更正为丙 → 乙的旧回执重送（迟到、幂等、不计数）
+        → 重装一份新稿。返回两份装配稿与逐行凭据，供逐份核对实际采用事件。
+        """
+        link = "speaker-relabel-traceability"
+
+        # 1) 机器结果到达并被领取（尚未人工确认）。
+        machine_event, created, machine_msg = self.relabel.record_machine(
+            segment_id=segment_id, label=machine_label,
+            operator="转写引擎", receipt_id=machine_receipt, line_no=line_no,
+        )
+        self._log(link, "machine_relabel", "ok" if created else "idempotent", machine_msg)
+
+        line_spec = [{"line_no": line_no, "segment_id": segment_id, "text": line_text}]
+
+        # 2) 首份装配：正文采用已领取的机器标签乙，凭据跟随实际正文。
+        first_draft = self.assembly.assemble(
+            version_id=version_id, task_id=f"TASK-{version_id}",
+            media_id=f"MEDI-{version_id}", line_specs=line_spec,
+        )
+        self.assembly.link_pack(pack_id, first_draft.draft_id)
+        first_line = first_draft.line_for_segment(segment_id)
+        self._log(
+            link, "first_assembly", "ok",
+            f"{first_draft.draft_id} 采用 {first_line.label if first_line else '-'}",
+        )
+
+        # 3) 人工更正为丙：人工结论即时生效，机器领取被覆盖。
+        manual_event, manual_msg = self.relabel.record_manual(
+            segment_id=segment_id, label=manual_label,
+            operator=operator, line_no=line_no,
+        )
+        self._log(link, "manual_relabel", "ok", manual_msg)
+
+        # 4) 乙的旧回执重送：迟到机器结果不能更改人工结论，且不增加改标次数。
+        late_event, late_created, late_msg = self.relabel.record_machine(
+            segment_id=segment_id, label=machine_label,
+            operator="转写引擎",
+            receipt_id=late_receipt or f"{machine_receipt}-LATE",
+            line_no=line_no,
+        )
+        self._log(link, "late_machine_redeliver", "rejected" if not late_event.applied else "ok", late_msg)
+
+        # 同一张旧回执再重送一次：必须幂等。
+        dup_event, dup_created, dup_msg = self.relabel.record_machine(
+            segment_id=segment_id, label=machine_label,
+            operator="转写引擎",
+            receipt_id=late_receipt or f"{machine_receipt}-LATE",
+            line_no=line_no,
+        )
+        self._log(link, "receipt_redeliver_idempotent", "idempotent" if not dup_created else "FAIL", dup_msg)
+
+        # 5) 重装一份：新稿正文采用人工标签丙；首包/首稿保持冻结不变。
+        second_draft = self.assembly.assemble(
+            version_id=version_id, task_id=f"TASK-{version_id}",
+            media_id=f"MEDI-{version_id}", line_specs=line_spec,
+        )
+        second_line = second_draft.line_for_segment(segment_id)
+        self._log(
+            link, "reassemble", "ok",
+            f"{second_draft.draft_id} 采用 {second_line.label if second_line else '-'}",
+        )
+
+        return {
+            "link": link,
+            "ok": True,
+            "machine_event": machine_event.to_dict(),
+            "manual_event": manual_event.to_dict(),
+            "late_event": late_event.to_dict(),
+            "late_redeliver_idempotent": not dup_created,
+            "manual_change_count": self.relabel.manual_change_count(segment_id),
+            "first_draft": first_draft.to_dict(),
+            "second_draft": second_draft.to_dict(),
+            "first_pack_draft_id": self.assembly.draft_for_pack(pack_id).draft_id,
+            "first_line_provenance": self.assembly.line_provenance(pack_id, line_no),
+        }
+
+    def link12_relabel_restart_readback(
+        self, ledger: RelabelEventLedger, assembly: TranscriptAssemblyService,
+        pack_id: str, delivered_lines: list[dict[str, Any]],
+        operator: str,
+    ) -> dict[str, Any]:
+        """链路12：模拟重启——用新实例从持久化文件读回，并与已发字幕逐行对照。"""
+        link = "relabel-restart-readback"
+        comparison = assembly.compare_with_delivery(pack_id, delivered_lines)
+        operator_events = [
+            event.to_dict() for event in ledger.events_for_operator(operator)
+        ]
+        self._log(
+            link, "readback", "ok",
+            f"{len(ledger.list_events())} 事件读回，对照 {len(comparison)} 行",
+        )
+        return {
+            "link": link,
+            "ok": True,
+            "readback_events": len(ledger.list_events()),
+            "comparison": comparison,
+            "all_match": all(item["match"] for item in comparison),
+            "operator_events": operator_events,
         }

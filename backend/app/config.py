@@ -1,5 +1,7 @@
-"""运行配置：端口、跨域、运行环境。"""
+"""运行配置：端口、跨域、运行环境与可追溯持久化目录。"""
 from __future__ import annotations
+
+from pathlib import Path
 
 from dataclasses import dataclass, field
 
@@ -17,6 +19,8 @@ class Settings:
     )
     page_size_default: int = 20
     page_size_max: int = 200
+    # 改标事件、转写装配稿与字幕包来源记录的持久化目录，重启后仍可读回。
+    runtime_dir: Path = Path(__file__).resolve().parent.parent / "runtime_data"
 
 
 settings = Settings()

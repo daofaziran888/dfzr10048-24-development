@@ -24,6 +24,8 @@ from app.services.sample_qc import SampleQcService
 from app.services.delivery_receipt import DeliveryReceiptService
 from app.services.archive_shelf import ArchiveShelfService
 from app.services.media_audit import MediaAuditService
+from app.services.relabel_event import RelabelEventService
+from app.services.assembly_draft import AssemblyDraftService
 
 SERVICES: dict[str, BaseModuleService] = {
     "media_source": MediaSourceService(),
@@ -48,6 +50,8 @@ SERVICES: dict[str, BaseModuleService] = {
     "delivery_receipt": DeliveryReceiptService(),
     "archive_shelf": ArchiveShelfService(),
     "media_audit": MediaAuditService(),
+    "relabel_event": RelabelEventService(),
+    "assembly_draft": AssemblyDraftService(),
 }
 
 
